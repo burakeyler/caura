@@ -22,6 +22,7 @@ from core_api.schemas import RelationUpsert
 from core_api.services.audit_service import log_action
 from core_api.services.entity_extraction import extract_entities_from_content
 from core_api.services.entity_service import upsert_relation
+from core_api.services.task_tracker import record_task_failure
 
 logger = logging.getLogger(__name__)
 
@@ -309,8 +310,8 @@ async def process_entity_extraction(
     # the scaling plan, which was to land the work on a dedicated worker
     # fleet so core-api isn't CPU/memory-contended by burst-time LLM
     # calls. Full migration: CAURA-593 lands Pub/Sub first, then a new
-    # worker service subscribes to ``Topics.Pipeline.ENTITY_EXTRACT_REQUESTED``
-    # and this function becomes its handler body.
+    # worker service and topic contract land together, with this function as
+    # the handler body.
     #
     # H-02. Guards both of the trailing liveness checks — the one at the end of
     # the ``try`` and the one in the ``except``. It means "this memory MAY have
@@ -822,21 +823,57 @@ async def process_entity_extraction(
         # that names the collapsed form must still land on the merged row.
         key_to_id: dict[str, UUID] = {canonical_match_key(n): i for n, i in name_to_id.items()}
         rel_count = 0
+        rel_failed = 0
         for rel in graph.relations:
             from_id = name_to_id.get(rel.from_entity) or key_to_id.get(canonical_match_key(rel.from_entity))
             to_id = name_to_id.get(rel.to_entity) or key_to_id.get(canonical_match_key(rel.to_entity))
             if from_id and to_id:
-                await upsert_relation(
-                    RelationUpsert(
-                        tenant_id=tenant_id,
-                        fleet_id=fleet_id,
-                        from_entity_id=from_id,
-                        relation_type=rel.relation_type,
-                        to_entity_id=to_id,
-                        evidence_memory_id=memory_id,
-                    ),
-                )
-                rel_count += 1
+                # Guarded PER RELATION, matching ``subject_writeback`` /
+                # ``predicate_writeback`` below. Unguarded, ONE failing upsert
+                # threw out of this whole function into the outer "(non-fatal)"
+                # handler — and everything after this loop is what actually
+                # feeds the deterministic contradiction path: the A65 predicate
+                # write-back, and the ``Trigger.ENTITY`` fire that is the ONLY
+                # thing that runs A40's RDF pass. So a single transient storage
+                # error on one relation out of dozens left that memory with a
+                # NULL predicate forever and no Path C detection at all, and
+                # said "non-fatal" while doing it. Nothing retries.
+                #
+                # Observed, not hypothesised: a storage 500 on
+                # ``POST /entities/relations`` produced exactly this — every
+                # later stage skipped, one warning line, predicate never set.
+                try:
+                    await upsert_relation(
+                        RelationUpsert(
+                            tenant_id=tenant_id,
+                            fleet_id=fleet_id,
+                            from_entity_id=from_id,
+                            relation_type=rel.relation_type,
+                            to_entity_id=to_id,
+                            evidence_memory_id=memory_id,
+                        ),
+                    )
+                    rel_count += 1
+                except Exception:
+                    rel_failed += 1
+                    logger.warning(
+                        "relation_upsert failed for memory %s (%s -[%s]-> %s) (non-fatal)",
+                        memory_id,
+                        rel.from_entity,
+                        rel.relation_type,
+                        rel.to_entity,
+                        exc_info=True,
+                    )
+        if rel_failed:
+            # Surfaced as its own line so a partial graph is visible as a
+            # COUNT rather than N scattered warnings — a spike here means the
+            # entity graph is degrading quietly.
+            logger.warning(
+                "relation_upsert_partial memory=%s created=%d failed=%d",
+                memory_id,
+                rel_count,
+                rel_failed,
+            )
 
         # ---- A65: predicate write-back ----
         #
@@ -989,8 +1026,29 @@ async def process_entity_extraction(
         if wrote_graph_rows:
             await _purge_written_artifacts_if_dropped(sc, memory_id, tenant_id)
 
-    except Exception:
+    except Exception as exc:
         logger.exception("Entity extraction failed for memory %s (non-fatal)", memory_id)
+        # 09/02 M-40 — make the failure a ROW, not just a LINE.
+        #
+        # Every call site wraps this coroutine in ``tracked_task``, but that
+        # wrapper writes a ``BackgroundTaskLog`` row ONLY when the coroutine
+        # raises. This handler catches and returns normally — deliberately, and
+        # several tests pin that — so the wrapper saw success, the table an
+        # operator actually inspects stayed empty, the memory kept no entities,
+        # and nothing retried it or knew to.
+        #
+        # Recording here rather than re-raising keeps the non-raising contract
+        # intact. Raising would also work for the six production call sites,
+        # which are all wrapped, but it would turn a documented "logged
+        # non-fatal failure" into an unhandled task exception for any caller
+        # that is not — a distinction this module's handler comments reason
+        # about repeatedly.
+        #
+        # Observed cost of the silence: a storage 500 on
+        # ``POST /entities/relations`` killed the predicate write-back and the
+        # whole ``Trigger.ENTITY`` path for that memory, and presented as "A40
+        # does not work" — because nothing anywhere recorded a task had failed.
+        await record_task_failure("entity_extraction", memory_id, tenant_id, exc)
         # H-02, and the reason the check below is duplicated rather than moved
         # into a ``finally``. The normal-path call at the end of the ``try`` is
         # unreachable once anything between the link upsert and it raises — the

@@ -41,6 +41,10 @@ from common.organization_settings_merge import deep_merge as _deep_merge
 from common.provider_names import ProviderName
 from core_api.clients.storage_client import get_storage_client
 from core_api.config import settings as global_settings
+from core_api.constants import (
+    CRYSTALLIZER_DEDUP_THRESHOLD,
+    CRYSTALLIZER_MIN_CLUSTER_SIZE,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -144,6 +148,11 @@ DEFAULT_SETTINGS: dict = {
     },
     "crystallizer": {
         "auto_crystallize": None,
+        # A72 — the crowding retune. Both default to None, which resolves to
+        # today's constants, so an untouched tenant sweeps exactly as before
+        # and costs exactly as much.
+        "dedup_threshold": None,
+        "min_cluster_size": None,
     },
     "dedup": {
         "semantic_dedup_enabled": None,
@@ -636,6 +645,8 @@ _LEAF_TYPES: dict[str, type | tuple[type, ...]] = {
     "search.graph_retrieval": bool,
     "search.entity_retrieval": bool,
     "crystallizer.auto_crystallize": bool,
+    "crystallizer.dedup_threshold": float,
+    "crystallizer.min_cluster_size": int,
     "dedup.semantic_dedup_enabled": bool,
     "dedup.merge_near_duplicates": bool,
     "lifecycle.lifecycle_automation_enabled": bool,
@@ -1014,6 +1025,47 @@ class ResolvedConfig:
         val = self._ts.get("crystallizer", {}).get("auto_crystallize")
         return val if val is not None else True
 
+    @property
+    def crystallizer_dedup_threshold(self) -> float:
+        """Cosine floor for the near-duplicate sweep (default 0.95).
+
+        A72. The sweep exists to be the janitor for overlapping memories, and at
+        0.95 it only catches near-verbatim copies — the composites that actually
+        crowd recall sit around 0.75-0.90, so the pathology it was built for
+        passes underneath it untouched.
+
+        Lowering this is the retune, and it is per-tenant and default-unset for
+        one reason: every extra pair the band admits is an extra LLM
+        mergeability judgement. A tenant that wants the janitor to reach the
+        crowding band opts in and pays for it; nobody inherits that bill from a
+        deploy. ~0.80 is the value the report proposes; it is deliberately not
+        the default.
+
+        Clamped to [0.5, 1.0]. Below 0.5 the sweep stops being a duplicate
+        check and becomes a topic clusterer, which would merge unrelated rows.
+        """
+        val = self._ts.get("crystallizer", {}).get("dedup_threshold")
+        if val is None:
+            return CRYSTALLIZER_DEDUP_THRESHOLD
+        return min(1.0, max(0.5, float(val)))
+
+    @property
+    def crystallizer_min_cluster_size(self) -> int:
+        """Smallest cluster the sweep will crystallize (default 3).
+
+        A72. At 3 the most common overlap — a pair — is skipped entirely, so
+        two rows saying the same thing survive every sweep. 2 is the value that
+        closes that, and again it is opt-in: admitting pairs multiplies the
+        cluster count, and each cluster is an LLM re-extraction.
+
+        Floored at 2. A cluster of 1 is not a cluster, and allowing it would
+        hand single memories to the re-extractor.
+        """
+        val = self._ts.get("crystallizer", {}).get("min_cluster_size")
+        if val is None:
+            return CRYSTALLIZER_MIN_CLUSTER_SIZE
+        return max(2, int(val))
+
     # Dedup
     @property
     def semantic_dedup_enabled(self) -> bool:
@@ -1288,6 +1340,25 @@ async def get_raw_settings(tenant_id: str) -> dict:
 
 
 async def _load_and_cache(tenant_id: str) -> dict:
+    # The WRITER, on every miss — and this is the whole fix, not half of it.
+    #
+    # A miss here is rarely cold. ``update_settings`` invalidates, then
+    # broadcasts, and EVERY process — the publisher included, since
+    # ``subscribe(broadcast=True)`` gives each its own subscription — drops its
+    # copy and reloads through this function. That reload is the race: served by
+    # a replica it can return the PRE-update settings and cache them for the
+    # full 5 minutes, so a write meant to tighten a governance control appears
+    # to land and does not take effect. Re-caching a stale value is strictly
+    # worse than not caching at all — the TTL then hides the mistake for exactly
+    # as long as the cache was meant to help.
+    #
+    # Priming the entry post-write instead was tried and is not equivalent: the
+    # publisher receives its own broadcast and evicts what it just primed, so
+    # the reload happens anyway and has to be correct on its own.
+    #
+    # The cost is bounded by the thing the cache already guarantees: at most one
+    # read per tenant per TTL per process. That is what makes taking it from the
+    # primary affordable here and not elsewhere.
     resolved = await get_storage_client().get_org_settings(tenant_id)
     _settings_cache[tenant_id] = resolved
     logger.info("organization_settings cache miss for %s; loaded via storage-api and cached", tenant_id)
